@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,145 +12,167 @@ import (
 )
 
 const (
-	apiURL       = "https://slack.com/api/team.accessLogs"
-	token        = ""
-	startDate    = "2021-01-01"
-	pageSize     = 1000
-	rateLimit    = 20
-	rateLimitGap = 60 / rateLimit
+	apiURL      = "https://slack.com/api/team.accessLogs"
+	token       = ""
+	pageSize    = 1000
+	apiRateLimit = 20 // Max API calls per minute
 )
 
-type SlackResponse struct {
+type AccessLogResponse struct {
 	OK     bool `json:"ok"`
+	Error  string `json:"error"`
+	Logins []struct {
+		Username  string `json:"username"`
+		DateFirst int64  `json:"date_first"`
+		IP        string `json:"ip"`
+		UserAgent string `json:"user_agent"`
+		ISP       string `json:"isp"`
+	} `json:"logins"`
 	Paging struct {
+		Page  int `json:"page"`
 		Pages int `json:"pages"`
 	} `json:"paging"`
-	Logins []Login `json:"logins"`
 }
 
-type Login struct {
-	UserID    string `json:"user_id"`
-	Username  string `json:"username"`
-	DateLast  int64  `json:"date_last"`
-	IP        string `json:"ip"`
-	UserAgent string `json:"user_agent"`
-	ISP       string `json:"isp"`
-}
+func fetchLogs(before int64, apiCallCount *int) ([]map[string]string, error) {
+	var allLogs []map[string]string
+	page := 1
 
-func main() {
-	currentDate, _ := time.Parse("2006-01-02", startDate)
-	allLogins := make(map[int]map[string]Login) // Separate logins by year
-
-	for {
-		fmt.Printf("Fetching logs for date: %s\n", currentDate.Format("2006-01-02"))
-		epoch := currentDate.Unix()
-		hasMoreData := true
-
-		for page := 1; hasMoreData; page++ {
-			fmt.Printf("Fetching page %d...\n", page)
-			logins, hasMore := fetchLogs(epoch, page)
-
-			for _, login := range logins {
-				year := time.Unix(login.DateLast, 0).Year()
-				if _, exists := allLogins[year]; !exists {
-					allLogins[year] = make(map[string]Login)
-				}
-				key := login.Username + strconv.FormatInt(login.DateLast, 10)
-				allLogins[year][key] = login
-			}
-			hasMoreData = hasMore
-
-			// Rate limit: wait before making the next request
-			time.Sleep(time.Duration(rateLimitGap) * time.Second)
+	for page <= 50 { // Ensure we don't exceed the API's 100-page limit
+		// Check and pause if nearing rate limit
+		if *apiCallCount >= apiRateLimit {
+			fmt.Println("API rate limit reached. Pausing for a minute...")
+			time.Sleep(1 * time.Minute)
+			*apiCallCount = 0
 		}
 
-		// Move to the next month
-		currentDate = currentDate.AddDate(0, 1, 0)
+		fmt.Printf("Processing page %d with before=%d\n", page, before)
 
-		// Stop when reaching the current date
-		if currentDate.After(time.Now()) {
+		req, err := http.NewRequest("GET", apiURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		q := req.URL.Query()
+		q.Add("count", strconv.Itoa(pageSize))
+		q.Add("page", strconv.Itoa(page))
+		q.Add("before", strconv.FormatInt(before, 10))
+		req.URL.RawQuery = q.Encode()
+
+		req.Header.Set("Authorization", "Bearer "+token)
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		*apiCallCount++ // Increment API call count
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
+
+		var result AccessLogResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON: %w\nResponse body: %s", err, string(body))
+		}
+
+		if !result.OK {
+			return nil, fmt.Errorf("API error: %s", result.Error)
+		}
+
+		for _, login := range result.Logins {
+			// Skip duplicates
+			loginKey := fmt.Sprintf("%s_%d", login.Username, login.DateFirst)
+			if _, exists := processedLogins[loginKey]; exists {
+				continue
+			}
+			processedLogins[loginKey] = true
+
+			isoDate := time.Unix(login.DateFirst, 0).UTC().Format(time.RFC3339)
+			allLogs = append(allLogs, map[string]string{
+				"username":   login.Username,
+				"datelogin":  isoDate,
+				"ip":         login.IP,
+				"useragent":  login.UserAgent,
+				"isp":        login.ISP,
+			})
+		}
+
+		if page >= result.Paging.Pages {
 			break
 		}
+		page++
 	}
 
-	fmt.Println("Saving logs to separate yearly CSV files...")
-	for year, logins := range allLogins {
-		saveToYearlyCSV(year, logins)
-	}
-	fmt.Println("Done!")
+	return allLogs, nil
 }
 
-func fetchLogs(before int64, page int) ([]Login, bool) {
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", apiURL, nil)
+func saveLogsToCSV(filename string, logs []map[string]string) error {
+	file, err := os.Create(filename)
 	if err != nil {
-		log.Fatalf("Failed to create request: %v", err)
-	}
-
-	q := req.URL.Query()
-	q.Add("before", strconv.FormatInt(before, 10))
-	q.Add("count", strconv.Itoa(pageSize))
-	q.Add("page", strconv.Itoa(page))
-	req.URL.RawQuery = q.Encode()
-
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Fatalf("Failed to make API call: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("API call failed with status: %s", resp.Status)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatalf("Failed to read response body: %v", err)
-	}
-
-	var slackResp SlackResponse
-	if err := json.Unmarshal(body, &slackResp); err != nil {
-		log.Fatalf("Failed to parse response JSON: %v", err)
-	}
-
-	if !slackResp.OK {
-		log.Fatalf("API response indicates failure: %v", string(body))
-	}
-
-	return slackResp.Logins, page < slackResp.Paging.Pages
-}
-
-func saveToYearlyCSV(year int, logins map[string]Login) {
-	fileName := fmt.Sprintf("slack_logins_%d.csv", year)
-	file, err := os.Create(fileName)
-	if err != nil {
-		log.Fatalf("Failed to create CSV file for year %d: %v", year, err)
+		return err
 	}
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Write header
-	header := []string{"Username", "DateLogin", "IP", "UserAgent", "ISP"}
+	header := []string{"username", "datelogin", "ip", "useragent", "isp"}
 	if err := writer.Write(header); err != nil {
-		log.Fatalf("Failed to write header to CSV: %v", err)
+		return err
 	}
 
-	// Write logins
-	for _, login := range logins {
-		dateLogin := time.Unix(login.DateLast, 0).Format("2006-01-02-15:04:05")
+	for _, login := range logs {
 		record := []string{
-			login.Username,
-			dateLogin,
-			login.IP,
-			login.UserAgent,
-			login.ISP,
+			login["username"],
+			login["datelogin"],
+			login["ip"],
+			login["useragent"],
+			login["isp"],
 		}
 		if err := writer.Write(record); err != nil {
-			log.Fatalf("Failed to write record to CSV: %v", err)
+			return err
 		}
+	}
+
+	return nil
+}
+
+var processedLogins = make(map[string]bool) // To track processed logins
+
+func main() {
+	startDate := time.Date(2024, 11, 1, 0, 0, 0, 0, time.UTC)
+	endDate := time.Now().AddDate(0, 1, 0)
+	currentDate := startDate
+	apiCallCount := 0
+
+	for currentDate.Before(endDate) {
+		fmt.Printf("Fetching logs before %s...\n", currentDate.Format(time.RFC3339))
+		logs, err := fetchLogs(currentDate.Unix(), &apiCallCount)
+		if err != nil {
+			fmt.Printf("Error fetching logs: %v\n", err)
+			return
+		}
+
+		if len(logs) > 0 {
+			filename := fmt.Sprintf("slack_logs_%d-%02d.csv", currentDate.Year(), currentDate.Month())
+			fmt.Printf("Saving logs to %s...\n", filename)
+			if err := saveLogsToCSV(filename, logs); err != nil {
+				fmt.Printf("Error saving logs: %v\n", err)
+				return
+			}
+		}
+
+		// Pause for a minute at the end of processing each year
+		if currentDate.Month() == time.December {
+			fmt.Println("Completed a year of logs. Pausing for a minute...")
+			time.Sleep(1 * time.Minute)
+		}
+
+		// Increment by 1 month
+		currentDate = currentDate.AddDate(0, 1, 0)
 	}
 }

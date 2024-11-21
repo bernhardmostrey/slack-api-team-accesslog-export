@@ -14,12 +14,11 @@ import (
 
 const (
 	apiURL       = "https://slack.com/api/team.accessLogs"
-	token        = "" // Replace with your actual token
-	startDate    = "2018-01-01"       // Starting date in YYYY-MM-DD format
-	pageSize     = 1000               // Items per page
-	outputCSV    = "slack_logins.csv"
-	rateLimit    = 20                 // Max requests per minute
-	rateLimitGap = 60 / rateLimit     // Time gap in seconds between requests
+	token        = ""
+	startDate    = "2021-01-01"
+	pageSize     = 1000
+	rateLimit    = 20
+	rateLimitGap = 60 / rateLimit
 )
 
 type SlackResponse struct {
@@ -33,19 +32,15 @@ type SlackResponse struct {
 type Login struct {
 	UserID    string `json:"user_id"`
 	Username  string `json:"username"`
-	DateFirst int64  `json:"date_first"`
 	DateLast  int64  `json:"date_last"`
-	Count     int    `json:"count"`
 	IP        string `json:"ip"`
 	UserAgent string `json:"user_agent"`
 	ISP       string `json:"isp"`
-	Country   string `json:"country"`
-	Region    string `json:"region"`
 }
 
 func main() {
 	currentDate, _ := time.Parse("2006-01-02", startDate)
-	allLogins := make(map[string]Login)
+	allLogins := make(map[int]map[string]Login) // Separate logins by year
 
 	for {
 		fmt.Printf("Fetching logs for date: %s\n", currentDate.Format("2006-01-02"))
@@ -55,8 +50,14 @@ func main() {
 		for page := 1; hasMoreData; page++ {
 			fmt.Printf("Fetching page %d...\n", page)
 			logins, hasMore := fetchLogs(epoch, page)
+
 			for _, login := range logins {
-				allLogins[login.UserID+strconv.FormatInt(login.DateLast, 10)] = login
+				year := time.Unix(login.DateLast, 0).Year()
+				if _, exists := allLogins[year]; !exists {
+					allLogins[year] = make(map[string]Login)
+				}
+				key := login.Username + strconv.FormatInt(login.DateLast, 10)
+				allLogins[year][key] = login
 			}
 			hasMoreData = hasMore
 
@@ -73,8 +74,10 @@ func main() {
 		}
 	}
 
-	fmt.Println("Saving logs to CSV...")
-	saveToCSV(allLogins)
+	fmt.Println("Saving logs to separate yearly CSV files...")
+	for year, logins := range allLogins {
+		saveToYearlyCSV(year, logins)
+	}
 	fmt.Println("Done!")
 }
 
@@ -120,10 +123,11 @@ func fetchLogs(before int64, page int) ([]Login, bool) {
 	return slackResp.Logins, page < slackResp.Paging.Pages
 }
 
-func saveToCSV(logins map[string]Login) {
-	file, err := os.Create(outputCSV)
+func saveToYearlyCSV(year int, logins map[string]Login) {
+	fileName := fmt.Sprintf("slack_logins_%d.csv", year)
+	file, err := os.Create(fileName)
 	if err != nil {
-		log.Fatalf("Failed to create CSV file: %v", err)
+		log.Fatalf("Failed to create CSV file for year %d: %v", year, err)
 	}
 	defer file.Close()
 
@@ -131,24 +135,20 @@ func saveToCSV(logins map[string]Login) {
 	defer writer.Flush()
 
 	// Write header
-	header := []string{"UserID", "Username", "DateFirst", "DateLast", "Count", "IP", "UserAgent", "ISP", "Country", "Region"}
+	header := []string{"Username", "DateLogin", "IP", "UserAgent", "ISP"}
 	if err := writer.Write(header); err != nil {
 		log.Fatalf("Failed to write header to CSV: %v", err)
 	}
 
 	// Write logins
 	for _, login := range logins {
+		dateLogin := time.Unix(login.DateLast, 0).Format("2006-01-02-15:04:05")
 		record := []string{
-			login.UserID,
 			login.Username,
-			strconv.FormatInt(login.DateFirst, 10),
-			strconv.FormatInt(login.DateLast, 10),
-			strconv.Itoa(login.Count),
+			dateLogin,
 			login.IP,
 			login.UserAgent,
 			login.ISP,
-			login.Country,
-			login.Region,
 		}
 		if err := writer.Write(record); err != nil {
 			log.Fatalf("Failed to write record to CSV: %v", err)
